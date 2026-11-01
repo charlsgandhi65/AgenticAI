@@ -1,0 +1,60 @@
+Backend Setup Summary
+
+Project Path:
+AI-Calling-Agent/backend
+
+Current Backend Structure:
+- .env
+- .gitignore
+- backend_information.txt
+- main.py
+- requirements.txt
+- supabase_client.py
+- venv/
+
+Technology Stack:
+- Python
+- FastAPI
+- Uvicorn
+- Supabase Python client
+
+Dependencies (requirements.txt):
+- fastapi
+- uvicorn
+- supabase
+- python-dotenv
+
+Supabase Connection Design:
+- File: supabase_client.py
+- Uses dotenv to load environment variables.
+- Uses a single helper: get_supabase_client(use_service_role: bool = False)
+
+Environment Variables Used:
+- SUPABASE_URL
+- SUPABASE_ANON_KEY
+- SUPABASE_SERVICE_ROLE_KEY
+- SUPABASE_KEY (legacy fallback for anon mode)
+
+Two-Key Access Pattern Implemented:
+1. Anon key path (public/restricted access)
+	- Key: SUPABASE_ANON_KEY (or SUPABASE_KEY fallback)
+	- Endpoint: GET /supabase/users-test
+	- Intended use: normal read path that respects RLS policies
+
+2. Service-role key path (privileged backend-only access)
+	- Key: SUPABASE_SERVICE_ROLE_KEY
+	- Endpoint: GET /supabase/users-test-admin
+	- Intended use: backend-only trusted operations and diagnostics
+
+Health and Base Endpoints:
+- GET /
+- GET /health
+
+Verified Behavior:
+- Supabase connectivity is working.
+- With RLS enabled and no policies, anon path returns 0 visible rows.
+- Service-role path can read the existing row from users table.
+
+Important Security Note:
+- Never expose SUPABASE_SERVICE_ROLE_KEY to frontend clients.
+- Keep service role usage only on protected backend endpoints.

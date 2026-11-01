@@ -1,0 +1,126 @@
+# Milestone Technical Report 3: Calling Agent System Prompt Implementation
+
+## 1. Executive Summary
+
+This milestone successfully implements the complete Calling Agent System Prompt in the AI Calling Agent backend. The system establishes `backend/system_prompt.py` as the centralized authority for prompt formatting, dynamic user personalization (`{{user_first_name}}`, `{{user_last_name}}`, `{{assistant_name}}`), and contextual call injection (`user_preferences`, contact classification, `historical_memory`, `learned_memory`).
+
+The calling agent system prompt is consistently passed as the `system` message to the local Qwen/Ollama engine across every multi-turn turn, strictly adhering to caller-receptionist behavior rules, confidentiality mandates, and decision engine routing.
+
+---
+
+## 2. Files Created and Modified
+
+### Created Files:
+1. `backend/system_prompt.py`:
+   - Central module containing the 14-section Calling Agent System Prompt template.
+   - `load_raw_system_prompt_template()`: dynamically reads from `backend/system_prompt.txt` at runtime, with fallback to `DEFAULT_SYSTEM_PROMPT_TEMPLATE`.
+   - `is_valid_uuid(val)`: validates UUID format to protect PostgreSQL queries from syntax errors (`22P02`).
+   - `fetch_user_profile(user_id)`: queries Supabase `public.users` table for `first_name`, `last_name`, and `assistant_name` using authenticated UUIDs.
+   - `fetch_dynamic_context(user_id, caller_phone_number)`: aggregates active user preferences, priority contact flags, recent historical memories, and high-confidence learned memories into a dedicated, confidential internal reference section.
+   - `build_system_prompt(user_profile, dynamic_context)`: interpolates Mustache placeholders, applies graceful fallback defaults when profiles are incomplete, logs informative warnings, and attaches dynamic call context.
+2. `backend/tests/test_system_prompt.py`:
+   - Comprehensive unit and integration test suite (10 test cases) verifying template loading, variable substitution, multi-user isolation, fallback behavior, Supabase mock queries, confidential memory formatting, UUID validation, and Ollama message formatting.
+
+### Modified Files:
+1. `backend/voice_service.py`:
+   - Removed hardcoded fallback prompt `VOICE_SYSTEM_PROMPT`.
+   - Integrated `build_system_prompt` from `system_prompt.py`.
+   - Updated `generate_voice_response(history, user_text, system_prompt=None)` to enforce the personalized system prompt as the `{"role": "system", ...}` instruction across all turns.
+2. `backend/voice_session_manager.py`:
+   - Enhanced `VoiceSession` dataclass with `user_profile: dict[str, str] | None`, `dynamic_context: str | None`, and `system_prompt: str | None` to maintain session-level personalization across multi-turn interactions.
+3. `backend/voice_ws.py`:
+   - Imports `build_system_prompt`, `fetch_dynamic_context`, and `fetch_user_profile`.
+   - On WebSocket connection, loads the authenticated user's profile and call context, initializes `session.system_prompt`, and emits `assistant_name` in the `session_ready` event payload.
+   - In both binary audio turns (`execute_turn`) and text turns (`_run_text_turn`), passes `session.system_prompt` directly to `generate_voice_response`.
+4. `backend/main.py`:
+   - Updated `/ws/voice-conversation` endpoint to accept optional `caller_phone_number` query parameter and pass it into the WebSocket handler.
+
+---
+
+## 3. How System Prompt Loading Works
+
+1. **Centralized Template Maintenance**:
+   - Primary prompt text is maintained in `backend/system_prompt.txt` and mirrored in `backend/system_prompt.py` (`DEFAULT_SYSTEM_PROMPT_TEMPLATE`).
+   - When `load_raw_system_prompt_template()` is called, it inspects `backend/system_prompt.txt`. If present and non-empty, it reads the latest file contents immediately. If missing or unreadable, it falls back safely to the hardcoded module default.
+2. **Dynamic Context Separation**:
+   - The base 14 sections of the prompt remain static to preserve core behavioral boundaries (Identity, Personality, Opening, Understanding, Conversation Handling, Privacy, Hold/Takeover, Operating Principles).
+   - Dynamic parameters and contextual memories are appended under a distinct section: `## 15. Dynamic Call Context & Internal Memories`.
+
+---
+
+## 4. User Identity Retrieval and Dynamic Personalisation
+
+### Database Mapping:
+- Authenticated `user_id` (UUID) is extracted from Supabase JWT validation.
+- `fetch_user_profile` executes:
+  ```python
+  client.table("users").select("first_name, last_name, assistant_name").eq("user_id", user_id).limit(1).execute()
+  ```
+- No schema alterations or new columns/tables were created.
+
+### Dynamic Placeholders:
+- `{{user_first_name}}` -> User's first name (e.g. `rudra`)
+- `{{user_last_name}}` -> User's last name (e.g. `gandhi`)
+- `{{assistant_name}}` -> User's chosen assistant name (e.g. `Siri`)
+
+### Graceful Fallbacks & Logging:
+- If `first_name` is missing or empty: logs a warning and substitutes `"the user"`.
+- If `last_name` is missing: logs a warning and omits the last name placeholder cleanly without double-spacing.
+- If `assistant_name` is missing: logs a warning and substitutes `"Assistant"`.
+- Never invents false identities or hardcodes user names.
+- Strict multi-user isolation: User A's session exclusively uses User A's identity; User B's session exclusively uses User B's identity.
+
+---
+
+## 5. Dynamic Context & Confidentiality Protection
+
+Dynamic context is retrieved on-demand per call session via `fetch_dynamic_context(user_id, caller_phone_number)`:
+1. **User Preferences**: Retrieves active preferences from `user_preferences` (e.g., call handling rules).
+2. **Caller Context**: Checks `priority_contacts` and `contacts` by `phone_number` and `user_id`. Identifies whether the caller is a PRIORITY CONTACT or a KNOWN CONTACT.
+3. **Historical Memory**: Queries active records from `historical_memory` (ordered by `created_at desc`, limited to 3).
+4. **Learned Memory**: Queries active records from `learned_memory` (ordered by `confidence desc`, limited to 3).
+
+### Strict Confidentiality Guard:
+All dynamic context injected into Section 15 is prefixed with an unambiguous prompt directive:
+> `CONFIDENTIALITY MANDATE: The following contextual details are provided strictly for your internal reference to assist the call. You MUST NEVER disclose, quote, or reveal these internal user preferences, memories, or notes to the caller unless explicitly authorized by the user.`
+
+This ensures the agent uses historical context to understand the conversation without disclosing private user details, internal instructions, or notes.
+
+---
+
+## 6. Decision Engine Restrictions & Compliance
+
+The Calling Agent System Prompt reinforces backend decision engine authority:
+- **Rule Enforcement**: The existing call decision engine retains exclusive authority over `HANDLE`, `DECLINE`, and `ESCALATE`.
+- **Transfer Restrictions**: The agent never independently initiates transfers or tells callers that a transfer has completed until confirmed by the backend.
+- **Priority Routing**: Priority contact routing is strictly respected and never bypassed.
+
+---
+
+## 7. Verification and Testing
+
+### Unit and Integration Tests:
+- `backend/tests/test_system_prompt.py`: 10 passed
+  - Template loading and structure verification.
+  - Variable substitution for all three placeholders.
+  - Multi-user isolation across distinct identities.
+  - Missing field graceful fallbacks and warning logs.
+  - UUID validation guarding PostgreSQL from invalid syntax.
+  - Supabase profile query mocks.
+  - Dynamic context assembly and confidentiality mandate inclusion.
+  - Ollama system message parameter passing.
+- `backend/tests/test_voice_ws.py`: 4 passed
+  - Full WebSocket lifecycle with system prompt initialization.
+  - Barge-in / interrupt handling during conversation.
+  - Audio chunk and text turn pipelines with session identity.
+  - Clear conversation history.
+- Full Suite (`test_call_decision.py`, `test_prescreening.py`, `test_voice_service.py`, etc.):
+  - **68 total tests executed and PASSED (100% OK)**.
+
+### Live End-to-End Verification with Ollama (Qwen) & Supabase:
+- **Test User**: `412ef32b-796f-4738-8834-0a199e09a884` (Rudra Gandhi, Assistant: Siri).
+- **Turn 1 Input**: `"Hello, who is this?"`
+  - **Qwen Output**: `"Hello, this is Siri, rudra's personal assistant. How can I help you today?"`
+- **Turn 2 Input**: `"Can I speak to Rudra?"`
+  - **Qwen Output**: `"I'm sorry, but Rudra is currently unavailable. Would you like me to take a message for him or schedule a time that's convenient for him to call you back?"`
+- **Verification Result**: Perfect conversational receptionist behavior, zero markdown/emojis, consistent identity retention, and accurate multi-turn context.

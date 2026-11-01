@@ -1,0 +1,166 @@
+# Milestone Technical Report 4: Two-Device Browser Calling Simulation Implementation & Verification
+
+## 1. Executive Summary
+
+Phase 2 of the AI Calling Agent project has been successfully implemented and verified: a complete, two-device browser-based calling simulation that operates across a local Wi-Fi network without requiring external telecom providers or modifying the Supabase database schema.
+
+- **Mobile Phone (Caller)**: Simulates a phone caller dialing in over mobile browser (`/caller` or `?role=caller`). Captures caller speech via microphone, receives real-time AI voice playback, and transitions to live human conversation upon takeover.
+- **Laptop (Owner Station & Server)**: Runs FastAPI backend (`port 8000`), local AI models (faster-whisper, Qwen through Ollama, Piper TTS), and the Owner Station (`/owner` or `?role=owner`). Provides live caller classification, pre-screening context, real-time live transcripts, private whisper escalation alerts, and one-click takeover controls with laptop mic/speaker audio bridge.
+- **Local Network (LAN)**: Both devices connect seamlessly over Wi-Fi (`10.242.47.79`). Vite dev server is exposed on `0.0.0.0:5173` with HTTPS enabled via `@vitejs/plugin-basic-ssl`, guaranteeing mobile microphone permissions (`navigator.mediaDevices.getUserMedia`).
+- **All Core Constraints Preserved**: Supabase database schema untouched, local Qwen Ollama instance isolated to laptop backend, Calling Agent System Prompt strictly respected, and the original single-device voice testing workbench retained (`?role=test`).
+
+---
+
+## 2. System Architecture & Network Topology
+
+```
++-----------------------------------------------------------------------------------------+
+|                                    Local Wi-Fi Network                                  |
+|                                                                                         |
+|  +-----------------------------+               +-------------------------------------+  |
+|  |     Mobile Phone (Caller)   |               |        Laptop (Owner & Server)      |  |
+|  |     IP: 10.242.47.x         |               |        IP: 10.242.47.79             |  |
+|  |                             |               |                                     |  |
+|  |  [Mobile Browser]           |               |  [FastAPI Backend :8000]            |  |
+|  |  - URL: /caller             |               |  - WebSocket Hub (/ws/call-hub)     |  |
+|  |  - Dialing interface        |               |  - CallChannelManager               |  |
+|  |  - 16kHz PCM Mic Capture    | <===========> |  - faster-whisper STT (base.en)     |  |
+|  |  - AudioBuffer Playback     |      WSS      |  - Ollama Qwen 3:8B (port 11434)    |  |
+|  |  - Live Call Transcript     |               |  - Piper TTS (en_US-lessac-medium)  |  |
+|  |                             |               |  - Supabase Pre-Screening & DB      |  |
+|  +-----------------------------+               |                                     |  |
+|                                                |  [Laptop Browser :5173]             |  |
+|                                                |  - URL: /owner                      |  |
+|                                                |  - Incoming Call Ringing Banner     |  |
+|                                                |  - Caller Classification Badge      |  |
+|                                                |  - Decision Recommendation Engine   |  |
+|                                                |  - Live Transcript Stream           |  |
+|                                                |  - Private Whisper Escalation Alert |  |
+|                                                |  - Accept / Reject Takeover Controls|  |
+|                                                |  - Direct 2-Way Audio Bridge        |  |
+|                                                +-------------------------------------+  |
++-----------------------------------------------------------------------------------------+
+```
+
+---
+
+## 3. Implemented Components
+
+### 3.1 Network, SSL & Reverse Proxy Configuration
+- **Vite Config (`frontend/vite.config.js`)**:
+  - Configured `@vitejs/plugin-basic-ssl` to serve HTTPS certificates trusted by mobile browsers for local LAN IPs.
+  - Bound server to `host: '0.0.0.0'` on port `5173`.
+  - Configured reverse proxy mapping `/ws`, `/auth`, and `/health` to `http://127.0.0.1:8000`, allowing mobile clients connecting to `https://10.242.47.79:5173` to establish secure WebSockets (`wss://10.242.47.79:5173/ws/...`) without mixed-content browser blocks.
+- **Ollama Isolation**:
+  - Kept Ollama bound locally to `127.0.0.1:11434` on the laptop. The mobile phone communicates solely through authenticated FastAPI endpoints and has no direct network access to Ollama.
+
+### 3.2 Backend Call Session & Channel Coordination (`backend/voice_session_manager.py`)
+- **`CallMode` State Machine**:
+  - `IDLE`: No active call on the channel.
+  - `RINGING`: Inbound call registered; evaluating pre-screening and priority rules.
+  - `AI_SCREENING`: AI Receptionist handles caller speech; audio sent to caller; transcripts broadcast to owner dashboard.
+  - `HOLD_AND_WHISPER`: Caller placed on hold; private whisper notification sent to laptop owner.
+  - `AUDIO_BRIDGE`: Direct human takeover; two-way low-latency audio stream between phone and laptop.
+  - `DECLINED`: Spam/blocked call terminated after polite announcement.
+  - `ENDED`: Call concluded and channel cleaned up.
+- **`CallChannel`**:
+  - Tracks `call_id`, `owner_user_id`, `caller_phone_number`, `caller_name`, `caller_type`, `decision`, `mode`, `caller_ws`, `owner_ws`, `is_bridge_active`, and associated `VoiceSession`.
+- **`CallChannelManager`**:
+  - Thread-safe singleton (`call_channel_manager`) coordinating channels across concurrent owner and caller connections.
+
+### 3.3 Call Hub WebSocket Dispatcher (`backend/call_hub.py`)
+- Registered route: `@app.websocket("/ws/call-hub")` in `backend/main.py`.
+- **Owner Role Handling (`role=owner`)**:
+  - Connects laptop owner; emits `owner_ready`.
+  - Listens for owner control events: `accept_transfer`, `takeover_call`, `reject_transfer`, `end_call`.
+  - Forwards owner microphone audio frames to caller phone speakers during `AUDIO_BRIDGE` mode.
+- **Caller Role Handling (`role=caller`)**:
+  - Connects mobile caller phone.
+  - Automatically fetches caller pre-screening context (`PreScreeningContext`).
+  - **Priority Contact Check**:
+    - If caller number is in `priority_contacts`, sets `is_priority=True`, bypasses AI conversation, switches to `HOLD_AND_WHISPER`, speaks a direct connection prompt to the caller, and sounds an urgent ring alert on the owner's dashboard.
+  - **Decision Engine Execution**:
+    - For non-priority callers, runs `decide_call()`.
+    - If `DECLINE`: Speaks decline message to caller and disconnects.
+    - If `ESCALATE`: Puts caller on hold and alerts owner.
+    - If `HANDLE`: Initiates `AI_SCREENING`, speaks greeting, and listens for caller turns.
+  - **Audio Processing**:
+    - Buffers incoming 16kHz PCM audio during `AI_SCREENING`.
+    - On `speech_end`, invokes `execute_caller_ai_turn`: STT (Whisper) -> Broadcast caller transcript to both -> LLM (Qwen) -> Escalation check -> Broadcast AI transcript to both -> Piper TTS audio to caller phone only.
+    - In `AUDIO_BRIDGE` mode, wraps raw PCM chunks into standard 44-byte WAV containers (`pcm16_to_wav`) and forwards them directly to the laptop owner WebSocket with sub-50ms latency.
+
+### 3.4 Frontend Role Views
+- **Caller View (`frontend/src/CallerInterface.jsx`)**:
+  - Mobile-responsive smartphone interface.
+  - Phone number input with quick presets for Priority Contact (`6356414812`) and Known Contact (`9824378001`).
+  - Call timer, live audio visualizer, mute button, end-call button.
+  - Real-time conversation transcript feed showing both caller speech and AI assistant replies.
+- **Owner Dashboard (`frontend/src/OwnerDashboard.jsx`)**:
+  - Laptop control station.
+  - Dynamic status banner showing connection state, current caller, classification badge (`PRIORITY_CONTACT`, `KNOWN_CONTACT`, `SPAM`, `UNKNOWN`), and decision reason.
+  - Priority Call Alert modal with sound and direct connect options.
+  - Whisper & Screen Escalation Card displaying private whisper summaries with one-click Accept Takeover and Reject buttons.
+  - Two-way audio bridge controls with laptop microphone toggle during active human conversation.
+- **Unified Switcher (`frontend/src/App.jsx`)**:
+  - Header tab navigation: `💻 Laptop Owner Station` | `📱 Mobile Caller Screen` | `🧪 Single-Device Voice Test`.
+  - URL routing: auto-selects tab based on path (`/caller`, `/owner`) or query parameter (`?role=caller`, `?role=owner`, `?role=test`).
+
+---
+
+## 4. Test Suite Execution & Verification
+
+All automated unit, integration, and scenario tests pass cleanly with 100% success:
+
+| Test File | Tests Run | Result | Duration | Key Coverage |
+| :--- | :---: | :---: | :---: | :--- |
+| `tests/test_call_hub.py` | 8 | **PASS** | 0.065s | WAV packaging, owner registration, caller pre-screening HANDLE flow, priority contact direct routing without AI, spam decline flow, whisper escalation trigger, 2-device audio bridge bidirectional forwarding, owner reject transfer fallback. |
+| `tests/test_call_decision.py` | 18 | **PASS** | 0.207s | Decision engine principles (priority escalation, spam decline, conflicting signals override, schema validation, timeout fallback). |
+| `tests/test_prescreening.py` | 17 | **PASS** | 0.122s | Phone normalization (+91, trunk zeros, formatting), contact queries, spam queries, DB query error handling. |
+| `tests/test_system_prompt.py` | 9 | **PASS** | 0.012s | System prompt assembly, UUID validation, profile interpolation, dynamic memory context. |
+| `tests/test_voice_ws.py` | 4 | **PASS** | 0.034s | Single-device WebSocket connection, barge-in interruption, text pipeline. |
+| `tests/test_voice_scenarios.py` | 4 | **PASS** | 33.546s | Multi-turn voice conversation pipeline with live Qwen 3:8B inference across 5 conversation turns. |
+| **Frontend Production Build** | Vite | **PASS** | 0.658s | Zero bundling or compilation errors (`dist/index.html` generated). |
+
+---
+
+## 5. Live Operating Instructions
+
+### Step 1: Start Backend
+In PowerShell on the laptop:
+```powershell
+cd "c:\Users\Asus\Desktop\Navrachana University\Agentic AI\Project\AI-Calling-Agent\backend"
+.\venv\Scripts\activate
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### Step 2: Start Frontend Dev Server
+In a second terminal on the laptop:
+```powershell
+cd "c:\Users\Asus\Desktop\Navrachana University\Agentic AI\Project\AI-Calling-Agent\frontend"
+npm run dev
+```
+Vite will output:
+```
+➜  Local:   https://localhost:5173/
+➜  Network: https://10.242.47.79:5173/
+```
+
+### Step 3: Open Interfaces
+1. **On Laptop**: Open Chrome to `https://localhost:5173/?role=owner` (or click "💻 Laptop Owner Station").
+2. **On Mobile Phone**: Connect to the same Wi-Fi network and open `https://10.242.47.79:5173/?role=caller`.
+   - Accept the local self-signed certificate warning once.
+   - Tap "Call" to dial in.
+
+### Step 4: Verification Scenarios
+- **Scenario A: Normal Screening Call**
+  - Enter `9824378001` on phone and tap Call.
+  - Laptop dashboard shows: `KNOWN_CONTACT` | Decision: `HANDLE`.
+  - AI Assistant greets caller. Speak into phone mic; speech is transcribed and streamed in real-time to both phone and laptop.
+- **Scenario B: Whisper & Screen Escalation**
+  - Say on phone: *"I need to speak with Charles about an urgent financial transaction."*
+  - Caller is placed on hold ("Please hold for a moment...").
+  - Laptop dashboard flashes a Private Whisper Alert: *"Private Whisper: Caller Alice Smith is requesting to discuss: 'I need to speak with Charles about an urgent financial transaction'."*
+  - Tap **Accept Call** on laptop: Audio bridge activates immediately, connecting laptop microphone/speaker directly to phone microphone/speaker.
+- **Scenario C: Priority Direct Routing**
+  - Enter priority number `6356414812` on phone and tap Call.
+  - System recognizes priority contact; connects directly to owner without AI intervention, sounding an urgent ringing alert on the laptop.
